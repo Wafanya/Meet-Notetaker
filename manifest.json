@@ -1,37 +1,29 @@
 {
   "manifest_version": 3,
   "name": "Meet Notetaker",
-  "version": "8.0",
-  "description": "Auto-transcribes Google Meet using live captions. Saves to Notion with speaker names.",
+  "version": "10.0",
+  "description": "Auto-transcribes Google Meet using live captions. Sends to n8n for AI summary and Slack DM.",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "tabs",
+    "alarms"
   ],
   "host_permissions": [
     "https://meet.google.com/*",
-    "https://api.notion.com/*"
+    "https://forma-tools.tech/*"
   ],
   "content_scripts": [
     {
-      "matches": [
-        "https://meet.google.com/*"
-      ],
-      "js": [
-        "hook.js"
-      ],
+      "matches": ["https://meet.google.com/*"],
+      "js": ["hook.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": [
-        "https://meet.google.com/*"
-      ],
-      "js": [
-        "content.js"
-      ],
-      "css": [
-        "styles.css"
-      ],
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

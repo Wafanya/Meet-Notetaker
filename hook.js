@@ -75,12 +75,51 @@
     }
   }, 1000);
 
-  // Автозапуск транскрипції
-  setTimeout(() => {
-    document.querySelectorAll('button').forEach(btn => {
-      if (/start transcri/i.test(btn.getAttribute('aria-label') || '')) btn.click();
-    });
-  }, 4000);
+  // Автозапуск Captions (CC) — шукаємо кнопку з aria-label "Turn on captions"
+  // або іншою локалізацією. Retry до 30 разів (60 сек) бо UI може повільно з'являтись.
+  let ccAttempts = 0;
+  let ccEnabled = false;
+  const ccInterval = setInterval(() => {
+    if (ccEnabled || ccAttempts > 30) { clearInterval(ccInterval); return; }
+    ccAttempts++;
 
-  console.log('[Notetaker hook] v21 ready');
+    // Чи вже працюють субтитри? Якщо є нові елементи від KPn5nb — CC ввімкнено
+    if (document.querySelector('[jscontroller="KPn5nb"]')) {
+      ccEnabled = true;
+      console.log('[Notetaker] CC already on (detected utterances)');
+      clearInterval(ccInterval);
+      return;
+    }
+
+    // Шукаємо кнопку. Працює з різними мовами:
+    // EN: "Turn on captions", UK: "Увімкнути субтитри", DE/FR/ES і т.д.
+    const buttons = document.querySelectorAll('button[aria-label], button[data-tooltip]');
+    for (const btn of buttons) {
+      const label = (btn.getAttribute('aria-label') || btn.getAttribute('data-tooltip') || '').toLowerCase();
+      // CC button. Не плутати з "Start transcription" (Drive transcript).
+      if (
+        /turn on cap/i.test(label) ||
+        /captions on/i.test(label) ||
+        /увімкнути субтитри/i.test(label) ||
+        /включити субтитри/i.test(label) ||
+        /turn on subt/i.test(label) ||
+        /activer les sous/i.test(label) ||
+        /untertitel aktiv/i.test(label) ||
+        /activar subt/i.test(label)
+      ) {
+        btn.click();
+        console.log('[Notetaker] CC button clicked, label:', label);
+        ccEnabled = true;
+        clearInterval(ccInterval);
+        return;
+      }
+    }
+
+    if (ccAttempts === 5) {
+      console.warn('[Notetaker] CC button not found yet — will keep trying. Available aria-labels:',
+        Array.from(buttons).map(b => b.getAttribute('aria-label')).filter(Boolean).slice(0, 10));
+    }
+  }, 2000);
+
+  console.log('[Notetaker hook] v22 ready');
 })();

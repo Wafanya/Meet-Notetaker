@@ -1,196 +1,166 @@
-// Meet Notetaker — background.js v3
+// Meet Notetaker — background.js v10
+// Sole responsibility: send meeting payloads to n8n. No Notion API calls — n8n handles all that.
+// Includes retry logic and a periodic sweep of pending records from chrome.storage.local.
+
+const N8N_WEBHOOK_URL = 'https://forma-tools.tech/webhook/meeting-complete';
+
+// In-memory tracking of in-flight retries so we don't double-send.
+const inFlight = new Set();
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'SAVE_TO_NOTION') {
-    console.log('[Notetaker BG] SAVE_TO_NOTION received, segments:', msg.data?.segments?.length);
-    saveToNotion(msg.data)
+  if (msg.type === 'SEND_MEETING') {
+    console.log('[Notetaker BG] SEND_MEETING received, meetingId:', msg.data?.meetingId, 'segments:', msg.data?.segments?.length);
+    sendMeeting(msg.data)
       .then(res => {
-        console.log('[Notetaker BG] save OK, url:', res.url);
-        sendResponse({ ok: true, url: res.url });
+        console.log('[Notetaker BG] send OK');
+        sendResponse({ ok: true, ...res });
       })
       .catch(e => {
-        console.error('[Notetaker BG] save FAILED:', e.message);
+        console.error('[Notetaker BG] send FAILED:', e.message);
         sendResponse({ ok: false, error: e.message });
       });
     return true; // keep channel open for async response
   }
-  if (msg.type === 'CLEAR_SESSION_PAGE') {
-    // Clear page entry for this specific meeting
-    const mid = msg.meetingId || 'default';
-    chrome.storage.session.remove([`page_${mid}_id`, `page_${mid}_url`]);
-    sendResponse({ ok: true });
+  if (msg.type === 'RETRY_PENDING') {
+    retryPendingRecords()
+      .then(res => sendResponse({ ok: true, ...res }))
+      .catch(e => sendResponse({ ok: false, error: e.message }));
     return true;
   }
 });
 
-const NOTION_VERSION = '2022-06-28';
-
 async function getConfig() {
-  const { notionToken, notionDbId } = await chrome.storage.sync.get(['notionToken', 'notionDbId']);
-  if (!notionToken || !notionDbId) {
-    throw new Error('Notion token or Database ID not set. Open the extension popup and fill them in.');
+  const { notionDbId, slackUserId } = await chrome.storage.sync.get(['notionDbId', 'slackUserId']);
+  if (!notionDbId) {
+    throw new Error('Notion Database ID not set. Open the extension popup.');
   }
-  return { TOKEN: notionToken, DB_ID: notionDbId };
+  return { DB_ID: notionDbId, SLACK_USER_ID: slackUserId || '' };
 }
 
-function headers(token) {
-  return {
-    'Authorization': `Bearer ${token}`,
-    'Notion-Version': NOTION_VERSION,
-    'Content-Type': 'application/json'
+// Send meeting payload to n8n. Throws on failure so the caller can mark the record pending-send.
+async function sendMeeting({ meetingId, title, segments, participants, duration, startedAt }) {
+  const { DB_ID, SLACK_USER_ID } = await getConfig();
+
+  const payload = {
+    meetingId,
+    title:        title || 'Untitled meeting',
+    segments:     segments || [],
+    participants: participants || '—',
+    duration:     duration || '—',
+    slackUserId:  SLACK_USER_ID,
+    databaseId:   DB_ID,
+    startedAt,
+    savedAt:      new Date().toISOString()
   };
-}
 
-function buildBlocks(segments, participants, duration) {
-  const blocks = [];
-  blocks.push({
-    object: 'block', type: 'callout',
-    callout: {
-      rich_text: [{ type: 'text', text: { content: `👥 ${participants}  •  ⏱ ${duration}` } }],
-      icon: { emoji: '🎙️' }, color: 'gray_background'
-    }
-  });
-  blocks.push({ object: 'block', type: 'divider', divider: {} });
-  blocks.push({
-    object: 'block', type: 'heading_2',
-    heading_2: { rich_text: [{ type: 'text', text: { content: 'Transcript' } }] }
-  });
+  console.log('[Notetaker BG] sending to n8n, segments:', payload.segments.length);
 
-  for (const s of (segments || [])) {
-    const lbl = `[${s.time}] ${s.name}:  `;
-    const MAX = 1900;
-    for (let i = 0; i < s.text.length; i += MAX) {
-      blocks.push({
-        object: 'block', type: 'paragraph',
-        paragraph: {
-          rich_text: [
-            ...(i === 0 ? [{ type: 'text', text: { content: lbl }, annotations: { bold: true, color: 'blue' } }] : []),
-            { type: 'text', text: { content: s.text.slice(i, i + MAX) } }
-          ]
-        }
-      });
-    }
-  }
-
-  blocks.push({ object: 'block', type: 'divider', divider: {} });
-  blocks.push({
-    object: 'block', type: 'heading_2',
-    heading_2: { rich_text: [{ type: 'text', text: { content: 'Summary' } }] }
-  });
-  blocks.push({
-    object: 'block', type: 'paragraph',
-    paragraph: { rich_text: [{ type: 'text', text: { content: '← add summary here' }, annotations: { italic: true, color: 'gray' } }] }
-  });
-  return blocks;
-}
-
-async function appendBlocks(pageId, blocks, token) {
-  for (let i = 0; i < blocks.length; i += 100) {
-    const r = await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
-      method: 'PATCH',
-      headers: headers(token),
-      body: JSON.stringify({ children: blocks.slice(i, i + 100) })
-    });
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      console.warn('[Notetaker BG] appendBlocks error at', i, e.message);
-    }
-  }
-}
-
-async function deleteAllChildren(pageId, token) {
-  const ids = [];
-  let cursor;
-  do {
-    const url = `https://api.notion.com/v1/blocks/${pageId}/children?page_size=100${cursor ? '&start_cursor=' + cursor : ''}`;
-    const r = await fetch(url, { headers: headers(token) });
-    if (!r.ok) break;
-    const data = await r.json();
-    data.results.forEach(b => ids.push(b.id));
-    cursor = data.has_more ? data.next_cursor : undefined;
-  } while (cursor);
-  await Promise.all(ids.map(id =>
-    fetch(`https://api.notion.com/v1/blocks/${id}`, { method: 'DELETE', headers: headers(token) })
-  ));
-  console.log('[Notetaker BG] deleted', ids.length, 'blocks');
-}
-
-async function saveToNotion({ title, date, participants, duration, segments, meetingId }) {
-  const { TOKEN, DB_ID } = await getConfig();
-
-  // Try to reuse existing page from this session
-  let pageId, pageUrl;
-  // Key by meetingId so different meets don't share the same page
-  const meetKey = `page_${meetingId || 'default'}`;
-  try {
-    const stored = await chrome.storage.session.get([meetKey + '_id', meetKey + '_url']);
-    pageId  = stored[meetKey + '_id'];
-    pageUrl = stored[meetKey + '_url'];
-  } catch(e) {
-    console.warn('[Notetaker BG] session storage unavailable:', e.message);
-  }
-
-  const blocks = buildBlocks(segments, participants, duration);
-  console.log('[Notetaker BG] built', blocks.length, 'blocks, existing pageId:', pageId || 'none');
-
-  if (pageId) {
-    try {
-      await deleteAllChildren(pageId, TOKEN);
-      // Update participants property
-      await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
-        method: 'PATCH',
-        headers: headers(TOKEN),
-        body: JSON.stringify({
-          properties: { 'Participants': { rich_text: [{ text: { content: participants || '—' } }] } }
-        })
-      });
-      await appendBlocks(pageId, blocks, TOKEN);
-      console.log('[Notetaker BG] updated existing page');
-      return { url: pageUrl };
-    } catch(e) {
-      console.warn('[Notetaker BG] update failed, will create new page:', e.message);
-      pageId = null;
-    }
-  }
-
-  // Create new page
-  const now = new Date(), pad = n => String(n).padStart(2,'0');
-  const dateStr = date || `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
-  const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-
-  console.log('[Notetaker BG] creating page:', title);
-  const res = await fetch('https://api.notion.com/v1/pages', {
+  const r = await fetch(N8N_WEBHOOK_URL, {
     method: 'POST',
-    headers: headers(TOKEN),
-    body: JSON.stringify({
-      parent: { database_id: DB_ID },
-      icon: { emoji: '🎙️' },
-      properties: {
-        'Name':         { title:     [{ text: { content: title || `Meeting ${dateStr} ${timeStr}` } }] },
-        'Date':         { date:      { start: dateStr } },
-        'Participants': { rich_text: [{ text: { content: participants || '—' } }] }
-      },
-      children: blocks.slice(0, 100)
-    })
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(payload)
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.message || `Notion HTTP ${res.status}`);
+  if (!r.ok) {
+    throw new Error(`n8n returned ${r.status}`);
   }
 
-  const page = await res.json();
-  console.log('[Notetaker BG] page created:', page.id);
-
-  // Save to session
-  try {
-    await chrome.storage.session.set({ [meetKey + '_id']: page.id, [meetKey + '_url']: page.url });
-  } catch(e) {
-    console.warn('[Notetaker BG] could not save pageId to session:', e.message);
-  }
-
-  // Append remaining blocks
-  if (blocks.length > 100) await appendBlocks(page.id, blocks.slice(100), TOKEN);
-
-  return { url: page.url };
+  console.log('[Notetaker BG] n8n accepted, status:', r.status);
+  return { status: r.status };
 }
+
+// Sweep chrome.storage.local for records that need to be sent or cleaned up.
+// Called periodically and on extension startup.
+async function retryPendingRecords() {
+  const all = await chrome.storage.local.get(null);
+  const now = Date.now();
+  const MAX_AGE_PENDING = 7  * 24 * 60 * 60 * 1000; // 7 days
+  const MAX_AGE_SAVED   = 1  *      24 * 60 * 60 * 1000; // 1 day
+  const STALE_ACTIVE    = 60 *           60 * 1000; // 1 hour
+
+  let sent = 0, dropped = 0, marked = 0;
+
+  for (const [key, rec] of Object.entries(all)) {
+    if (!key.startsWith('meet_') || !rec || typeof rec !== 'object') continue;
+
+    const updated = rec.updatedAt || rec.lastActiveAt || 0;
+    const ageMs   = now - updated;
+
+    // Saved records older than 1 day → cleanup.
+    if (rec.status === 'saved' && ageMs > MAX_AGE_SAVED) {
+      await chrome.storage.local.remove(key);
+      dropped++;
+      continue;
+    }
+
+    // Active records that haven't been updated in over an hour → meeting probably ended without finalSave.
+    // Mark for sending.
+    if (rec.status === 'active' && ageMs > STALE_ACTIVE) {
+      rec.status = 'pending-send';
+      rec.endReason = rec.endReason || 'stale-active';
+      await chrome.storage.local.set({ [key]: rec });
+      marked++;
+    }
+
+    // Pending-send older than 7 days → give up, drop it (don't spam Slack with old meetings).
+    if (rec.status === 'pending-send' && ageMs > MAX_AGE_PENDING) {
+      await chrome.storage.local.remove(key);
+      dropped++;
+      continue;
+    }
+
+    // Pending-send → try to send.
+    if (rec.status === 'pending-send' && !inFlight.has(key)) {
+      inFlight.add(key);
+      try {
+        await sendMeeting({
+          meetingId:    rec.meetingId,
+          title:        rec.title,
+          segments:     rec.segments,
+          participants: rec.participants || Object.keys(rec.speakerColors || {}).join(', '),
+          duration:     rec.duration || formatDuration(rec.startTime, rec.lastActiveAt),
+          startedAt:    new Date(rec.startTime || updated).toISOString()
+        });
+        rec.status = 'saved';
+        rec.updatedAt = Date.now();
+        await chrome.storage.local.set({ [key]: rec });
+        sent++;
+      } catch (e) {
+        console.warn('[Notetaker BG] retry failed for', key, ':', e.message);
+        // Leave status as pending-send. Next sweep will try again.
+      } finally {
+        inFlight.delete(key);
+      }
+    }
+  }
+
+  console.log('[Notetaker BG] sweep done. sent:', sent, 'marked:', marked, 'dropped:', dropped);
+  return { sent, marked, dropped };
+}
+
+function formatDuration(startMs, endMs) {
+  if (!startMs || !endMs) return '—';
+  const s = Math.max(0, Math.floor((endMs - startMs) / 1000));
+  return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+// Periodic sweep every 5 minutes while the service worker is alive.
+// Note: MV3 service workers can be terminated when idle, so this is best-effort.
+// The real recovery happens in content.js on extension load.
+chrome.alarms.create('pending-sweep', { periodInMinutes: 5 });
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'pending-sweep') {
+    retryPendingRecords().catch(e => console.warn('[Notetaker BG] sweep error:', e.message));
+  }
+});
+
+// Also sweep on service worker startup.
+chrome.runtime.onStartup.addListener(() => {
+  console.log('[Notetaker BG] startup — running pending sweep');
+  retryPendingRecords().catch(e => console.warn('[Notetaker BG] startup sweep error:', e.message));
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  console.log('[Notetaker BG] installed — running pending sweep');
+  retryPendingRecords().catch(e => console.warn('[Notetaker BG] install sweep error:', e.message));
+});

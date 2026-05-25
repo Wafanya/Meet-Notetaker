@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { width: 280px; background: #1c1f26; color: rgba(255,255,255,0.85); font-family: 'Google Sans', Roboto, Arial, sans-serif; font-size: 13px; }
+    body { width: 300px; background: #1c1f26; color: rgba(255,255,255,0.85); font-family: 'Google Sans', Roboto, Arial, sans-serif; font-size: 13px; }
     .header { background: #13151a; padding: 14px 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
     .logo { width: 34px; height: 34px; background: #1a1a1a; border: 1px solid rgba(255,255,255,0.1); border-radius: 9px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: white; flex-shrink: 0; }
     .logo-text { font-weight: 500; font-size: 14px; }
@@ -24,6 +24,8 @@
     .hint a { color: #60a5fa; text-decoration: none; }
     .how { font-size: 11px; color: rgba(255,255,255,0.45); line-height: 1.6; }
     .how b { color: rgba(255,255,255,0.7); }
+    .field-help { font-size: 10px; color: rgba(255,255,255,0.3); margin-top: 3px; line-height: 1.4; }
+    .field-optional { font-size: 9px; color: rgba(255,255,255,0.25); margin-left: 4px; text-transform: lowercase; letter-spacing: 0; font-weight: normal; }
   </style>
 </head>
 <body>
@@ -31,28 +33,33 @@
     <div class="logo">N</div>
     <div>
       <div class="logo-text">Meet Notetaker</div>
-      <div class="logo-sub">v5.0 · Caption scraping</div>
+      <div class="logo-sub">v10 · Cloud sync</div>
     </div>
   </div>
   <div class="body">
     <div class="how">
-      Works by reading Google Meet's built-in captions — no audio recording, no API costs, all speakers captured automatically.
+      Records Meet captions and sends to your <b>Notion</b> database with AI summary in <b>Slack</b>.
     </div>
     <hr>
     <div>
-      <label>Notion Integration Token</label>
-      <input id="token" type="password" placeholder="ntn_..." />
+      <label>Notion Database ID</label>
+      <input id="dbid" type="text" placeholder="32-character ID" />
+      <div class="field-help">
+        From your database URL (between workspace name and <code>?v=</code>)
+      </div>
     </div>
     <div>
-      <label>Database ID</label>
-      <input id="dbid" type="text" placeholder="32-character ID" />
+      <label>Slack User ID <span class="field-optional">optional</span></label>
+      <input id="slackid" type="text" placeholder="U073SU0590U" />
+      <div class="field-help">
+        Slack → Profile → ••• → <b>Copy member ID</b>
+      </div>
     </div>
     <button id="save-btn">Save settings</button>
     <div id="status"></div>
     <hr>
     <div class="hint">
-      See <b>NOTION_SETUP.md</b> for setup help.<br>
-      <a href="https://www.notion.so/my-integrations" target="_blank">notion.so/my-integrations →</a>
+      The Notion integration is already configured. You only need to share your database with it. See README for instructions.
     </div>
   </div>
   <script src="popup.js"></script>

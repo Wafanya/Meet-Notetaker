@@ -1,7 +1,25 @@
-// Meet Notetaker v9 — ISOLATED world UI + Notion
+// Meet Notetaker v10 — ISOLATED world UI + persistent state + n8n webhook
+// Architecture:
+//  - chrome.storage.local: persistent backup every 10 sec (survives crashes)
+//  - On meeting end → status 'pending-send' → send to n8n
+//  - On send success → status 'saved'
+//  - On send failure → status stays 'pending-send', background.js retries via alarms
+//  - beforeunload uses navigator.sendBeacon (guaranteed delivery)
+//  - On extension load: scan for orphaned 'active' meetings, retry 'pending-send'
+
 (function () {
   if (document.getElementById('uatr-root')) return;
 
+  const N8N_WEBHOOK_URL = 'https://forma-tools.tech/webhook/meeting-complete';
+
+  // ── Meeting identifier (stable across reloads of the same Meet URL) ──
+  function getMeetingId() {
+    return location.pathname.replace(/^\//, '').split('?')[0] || 'unknown';
+  }
+  const MEETING_ID  = getMeetingId();
+  const STORAGE_KEY = `meet_${MEETING_ID}`;
+
+  // ── State ───────────────────────────────────────────────
   let segments     = [];
   let startTime    = null;
   let timerInterval = null;
@@ -9,10 +27,10 @@
   let paused       = false;
   let wordCount    = 0;
   let meetingTitle = '';
+  let lastActiveAt = Date.now();
 
-  // Auto-save state
-  let lastAutoSaveCount = 0;   // segments.length at last autosave
-  let autoSaveInterval  = null;
+  let persistInterval        = null;
+  let inactivityCheckInterval = null;
 
   const COLORS = ['#60a5fa','#34d399','#f472b6','#fbbf24','#a78bfa','#fb923c','#38bdf8','#4ade80'];
   const speakerColors = {};
@@ -26,25 +44,42 @@
 
   // ── DOM bridge ───────────────────────────────────────────
   const bridge = document.getElementById("__nt_bridge") || (() => { const d = document.createElement("div"); d.id = "__nt_bridge"; d.style.display = "none"; document.documentElement.appendChild(d); return d; })();
-  new MutationObserver(muts => { muts.forEach(m => { if (m.attributeName !== "data-msg") return; if (paused) return; try { const { speaker, text } = JSON.parse(bridge.getAttribute("data-msg")); if (!text || text.length < 2) return; processCaption(speaker || "You", text); } catch(e){} }); }).observe(bridge, { attributes: true });
+  new MutationObserver(muts => {
+    muts.forEach(m => {
+      if (m.attributeName !== "data-msg") return;
+      if (paused) return;
+      try {
+        const { speaker, text } = JSON.parse(bridge.getAttribute("data-msg"));
+        if (!text || text.length < 2) return;
+        processCaption(speaker || "You", text);
+      } catch(e) {}
+    });
+  }).observe(bridge, { attributes: true });
 
   function processCaption(name, text) {
     const clean = text.replace(/arrow_downward\s*Jump\s*to\s*bottom/gi,'').replace(/arrow_downward/gi,'').replace(/Jump\s*to\s*bottom/gi,'').trim();
     if (!clean || clean.length < 2) return;
 
+    lastActiveAt = Date.now();
+
     if (!startTime) {
       startTime = Date.now();
       timerInterval = setInterval(updateTimer, 1000);
       setDot('on');
-      meetingTitle = getMeetingTitle();
-      startAutoSave();
+      meetingTitle = getMeetingTitle() || meetingTitle;
+      startPersist();
+      startInactivityCheck();
     }
 
     const prev = committed[name];
     if (prev && (clean.startsWith(prev.slice(0, Math.min(prev.length, 25))) || prev.startsWith(clean.slice(0, Math.min(clean.length, 25))))) {
       const last = segments[segments.length - 1];
       if (last && last.name === name) {
-        if (clean.length >= last.text.length) { last.text = clean; committed[name] = clean; renderSegments(); }
+        if (clean.length >= last.text.length) {
+          last.text = clean;
+          committed[name] = clean;
+          renderSegments();
+        }
         return;
       }
     }
@@ -55,8 +90,19 @@
   }
 
   function getMeetingTitle() {
-    const sels = ['[data-meeting-title]','.u6vdEc','.AYbeo'];
-    for (const s of sels) { const el = document.querySelector(s); if (el) { const t = el.getAttribute('data-meeting-title') || el.textContent.trim(); if (t && t.length > 1 && t.length < 200) return t; } }
+    // 1. Best signal: data-meeting-title in the bottom call control bar (only present once joined).
+    const dmt = document.querySelector('[data-meeting-title]');
+    if (dmt) {
+      const t = dmt.getAttribute('data-meeting-title')?.trim();
+      if (t && t.length > 1 && t.length < 200) return t;
+    }
+    // 2. Inner text of the bottom-bar title element.
+    const innerEl = document.querySelector('.gSlHI .u6vdEc, .gSlHI [role="heading"]');
+    if (innerEl) {
+      const t = innerEl.textContent.trim();
+      if (t && t.length > 1 && t.length < 200) return t;
+    }
+    // 3. Fallback to page title.
     return document.title.replace(/\s*[-–]\s*Google Meet\s*$/i,'').trim() || '';
   }
 
@@ -85,8 +131,7 @@
           <span id="uatr-autosave-status"></span>
         </div>
         <div id="uatr-controls">
-          <button id="uatr-btn-save" class="uatr-ctrl-btn uatr-btn-drive"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M5 5h4M5 8h6M5 11h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg><span id="uatr-notion-label">Notion</span></button>
-          <button id="uatr-btn-download" class="uatr-ctrl-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 12h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+          <button id="uatr-btn-download" class="uatr-ctrl-btn uatr-btn-drive"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3 3 3-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 12h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg> Download</button>
           <button id="uatr-btn-clear" class="uatr-ctrl-btn"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M6 4V2.5h4V4M5 4l.5 9h5l.5-9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         </div>
       </div>
@@ -98,7 +143,6 @@
   const errBox = document.getElementById('uatr-error');
   const bodyEl = document.getElementById('uatr-body');
 
-  // ── Virtual render — only last 60 segments in DOM ────────
   const RENDER_LIMIT = 60;
   function renderSegments() {
     if (!segments.length) { segBox.innerHTML = '<p class="uatr-empty">Listening…</p>'; return; }
@@ -126,65 +170,123 @@
   }
   function buildFilename() { const now = new Date(), pad = n => String(n).padStart(2,'0'); return `meet-${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}.txt`; }
 
-  // ── Notion save ───────────────────────────────────────────
-  function saveToNotion(silent, onDone) {
-    if (!segments.length) { if (!silent) showError('Nothing to save.'); if (onDone) onDone(false); return; }
-    const label = document.getElementById('uatr-notion-label');
-    if (label && !silent) label.textContent = '…';
-    const now = new Date(), pad = n => String(n).padStart(2,'0');
-    const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
-    const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
-    const elapsed = startTime ? Math.floor((Date.now()-startTime)/1000) : 0;
+  // ── Persistent state (chrome.storage.local) ──────────────
+  // Saves every 10 sec. Status flow:
+  //  'active'        — meeting in progress
+  //  'pending-send'  — meeting ended, webhook not yet successful
+  //  'saved'         — webhook accepted, summary in progress on n8n
+  function persistState(status) {
+    if (!segments.length) return;
+    const data = {
+      meetingId:     MEETING_ID,
+      title:         meetingTitle,
+      startTime,
+      lastActiveAt:  Date.now(),
+      segments,
+      speakerColors,
+      committed,
+      colorIdx,
+      participants:  Object.keys(speakerColors).join(', ') || '—',
+      duration:      formatDuration(startTime, Date.now()),
+      status:        status || 'active',
+      updatedAt:     Date.now()
+    };
+    try {
+      chrome.storage.local.set({ [STORAGE_KEY]: data });
+    } catch (e) {
+      console.warn('[Notetaker] persistState failed:', e.message);
+    }
+  }
 
-    // Extract meet code from URL (e.g. "abc-defg-hij") as unique meeting key
-    const meetingId = location.pathname.replace(/^\//, '').split('?')[0] || 'unknown';
+  function formatDuration(startMs, endMs) {
+    if (!startMs) return '—';
+    const s = Math.max(0, Math.floor(((endMs || Date.now()) - startMs) / 1000));
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  function startPersist() {
+    if (persistInterval) return;
+    persistInterval = setInterval(() => persistState('active'), 10 * 1000);
+  }
+
+  // Restore on load if there's an unfinished meeting for this URL.
+  function tryRestore() {
+    chrome.storage.local.get([STORAGE_KEY], (data) => {
+      const saved = data[STORAGE_KEY];
+      if (!saved) return;
+      if (saved.status === 'saved') return;
+      if (!saved.segments || !saved.segments.length) return;
+
+      console.log('[Notetaker] restoring previous session:', saved.segments.length, 'segments, status:', saved.status);
+      segments     = saved.segments;
+      meetingTitle = saved.title || meetingTitle;
+      startTime    = saved.startTime || Date.now();
+      lastActiveAt = saved.lastActiveAt || Date.now();
+      colorIdx     = saved.colorIdx || 0;
+      Object.assign(speakerColors, saved.speakerColors || {});
+      Object.assign(committed, saved.committed || {});
+
+      if (!timerInterval) timerInterval = setInterval(updateTimer, 1000);
+      setDot('on');
+      startPersist();
+      startInactivityCheck();
+      renderSegments();
+      setAutoSaveStatus('↺ resumed');
+
+      // If status was pending-send, the meeting was already ended in a previous session.
+      // Trigger a re-send now via background.
+      if (saved.status === 'pending-send') {
+        console.log('[Notetaker] previous session was pending-send, triggering retry');
+        chrome.runtime.sendMessage({ type: 'RETRY_PENDING' }, () => {});
+      }
+    });
+  }
+
+  // ── Send to n8n via background.js ────────────────────────
+  function sendToN8N(reason, onDone) {
+    if (!segments.length) { if (onDone) onDone(false); return; }
+
+    // Snapshot the current state into a pending-send record BEFORE sending.
+    // If the send fails, background.js will retry via its periodic sweep.
+    persistState('pending-send');
 
     const payload = {
-      title: meetingTitle || `Meeting ${dateStr} ${timeStr}`,
-      date: dateStr,
+      meetingId:    MEETING_ID,
+      title:        meetingTitle || `Meeting ${MEETING_ID}`,
+      segments:     segments.map(s => ({ name: s.name, text: s.text, time: s.time })),
       participants: Object.keys(speakerColors).join(', ') || '—',
-      duration: Math.floor(elapsed/60)+'m '+(elapsed%60)+'s',
-      segments: segments.map(s => ({ name: s.name, text: s.text, time: s.time })),
-      meetingId
+      duration:     formatDuration(startTime, Date.now()),
+      startedAt:    new Date(startTime || Date.now()).toISOString(),
+      endReason:    reason || 'unknown'
     };
 
-    console.log('[Notetaker] sending to BG, segments:', payload.segments.length);
+    console.log('[Notetaker] sending to BG, segments:', payload.segments.length, 'reason:', reason);
 
     try {
-      chrome.runtime.sendMessage({ type: 'SAVE_TO_NOTION', data: payload }, res => {
+      chrome.runtime.sendMessage({ type: 'SEND_MEETING', data: payload }, res => {
         const err = chrome.runtime.lastError;
         if (err) {
           console.error('[Notetaker] sendMessage error:', err.message);
-          if (label) label.textContent = 'Notion';
-          if (!silent) showError('Notion: ' + err.message);
+          setAutoSaveStatus('⚠ will retry');
           if (onDone) onDone(false);
           return;
         }
         console.log('[Notetaker] BG response:', JSON.stringify(res));
         if (res?.ok) {
-          if (label) { label.textContent = '✓'; setTimeout(() => label.textContent = 'Notion', 2500); }
-          if (!silent) showSavedBanner(res.url);
-          lastAutoSaveCount = segments.length;
-          setAutoSaveStatus('✓ autosaved');
+          persistState('saved');
+          setAutoSaveStatus('✓ sent');
           if (onDone) onDone(true);
         } else {
-          if (label) label.textContent = 'Notion';
-          if (!silent) showError('Notion: ' + (res?.error || 'unknown error'));
+          // Status stays 'pending-send', background retries it.
+          setAutoSaveStatus('⚠ will retry');
           if (onDone) onDone(false);
         }
       });
     } catch(e) {
       console.error('[Notetaker] sendMessage threw:', e.message);
-      if (label) label.textContent = 'Notion';
-      if (!silent) showError('Notion: ' + e.message);
+      setAutoSaveStatus('⚠ will retry');
       if (onDone) onDone(false);
     }
-  }
-
-  function showSavedBanner(url) {
-    const b = document.createElement('div'); b.id = 'uatr-saved-banner';
-    b.innerHTML = url ? `✓ Saved to Notion — <a href="${url}" target="_blank" style="color:#34d399;text-decoration:underline">open</a>` : '✓ Saved to Notion';
-    document.getElementById('uatr-panel').appendChild(b); setTimeout(() => b.remove(), 6000);
   }
 
   function setAutoSaveStatus(msg) {
@@ -192,28 +294,31 @@
     if (el) { el.textContent = msg; setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000); }
   }
 
-  // ── Auto-save every 5 min to Notion ──────────────────────
-  function startAutoSave() {
-    if (autoSaveInterval) return;
-    autoSaveInterval = setInterval(() => {
-      if (!segments.length || segments.length === lastAutoSaveCount) return;
-      setAutoSaveStatus('saving…');
-      saveToNotion(true);
-    }, 5 * 60 * 1000);
+  // ── Inactivity check: 5+ min without new captions triggers final send ──
+  function startInactivityCheck() {
+    if (inactivityCheckInterval) return;
+    inactivityCheckInterval = setInterval(() => {
+      if (!startTime || finalSendDone) return;
+      const minsSinceActive = (Date.now() - lastActiveAt) / 60000;
+      if (minsSinceActive >= 5) {
+        console.log('[Notetaker] 5+ min of inactivity, finalising');
+        finalSend('inactivity');
+      }
+    }, 30 * 1000);
   }
 
-  // ── Final save on meet end ────────────────────────────────
-  let finalSaveDone = false;
-  function finalSave() {
-    if (finalSaveDone || !segments.length) return;
-    finalSaveDone = true;
-    clearInterval(autoSaveInterval);
-    saveToNotion(true);
+  // ── Final send on meet end ────────────────────────────────
+  let finalSendDone = false;
+  function finalSend(reason) {
+    if (finalSendDone || !segments.length) return;
+    finalSendDone = true;
+    console.log('[Notetaker] finalSend, reason:', reason);
+    clearInterval(persistInterval);
+    clearInterval(inactivityCheckInterval);
+    sendToN8N(reason);
   }
 
   // ── Controls ──────────────────────────────────────────────
-  document.getElementById('uatr-btn-save').addEventListener('click', () => saveToNotion(false));
-
   document.getElementById('uatr-btn-download').addEventListener('click', () => {
     if (!segments.length) return;
     const blob = new Blob([buildText()], {type:'text/plain;charset=utf-8'});
@@ -222,8 +327,10 @@
   });
 
   document.getElementById('uatr-btn-clear').addEventListener('click', () => {
-    segments=[]; wordCount=0; startTime=null; finalSaveDone=false; lastAutoSaveCount=0;
-    paused=false; clearInterval(autoSaveInterval); autoSaveInterval=null;
+    segments=[]; wordCount=0; startTime=null; finalSendDone=false;
+    paused=false;
+    clearInterval(persistInterval); persistInterval=null;
+    clearInterval(inactivityCheckInterval); inactivityCheckInterval=null;
     Object.keys(speakerColors).forEach(k=>delete speakerColors[k]);
     Object.keys(committed).forEach(k=>delete committed[k]);
     colorIdx=0; clearInterval(timerInterval);
@@ -232,11 +339,9 @@
     document.getElementById('uatr-pcount').textContent='—';
     setDot('off'); updatePauseButton();
     renderSegments();
-    const mid = location.pathname.replace(/^\//, '').split('?')[0] || 'unknown';
-    chrome.runtime.sendMessage({ type: 'CLEAR_SESSION_PAGE', meetingId: mid });
+    chrome.storage.local.remove([STORAGE_KEY]);
   });
 
-  // Pause / Resume
   function updatePauseButton() {
     const btn = document.getElementById('uatr-btn-pause');
     if (paused) {
@@ -251,7 +356,7 @@
   }
 
   document.getElementById('uatr-btn-pause').addEventListener('click', () => {
-    if (!startTime) return; // nothing recorded yet
+    if (!startTime) return;
     paused = !paused;
     setDot(paused ? 'paused' : 'on');
     updatePauseButton();
@@ -266,7 +371,12 @@
       :'<line x1="2" y1="7" x2="12" y2="7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>';
   });
 
-  document.getElementById('uatr-btn-close').addEventListener('click', () => { clearInterval(timerInterval); clearInterval(autoSaveInterval); root.remove(); });
+  document.getElementById('uatr-btn-close').addEventListener('click', () => {
+    clearInterval(timerInterval);
+    clearInterval(persistInterval);
+    clearInterval(inactivityCheckInterval);
+    root.remove();
+  });
 
   // Drag
   const hdr = document.getElementById('uatr-header');
@@ -275,18 +385,60 @@
   document.addEventListener('mousemove', e => { if (!dragging) return; root.style.left=(e.clientX-ox)+'px'; root.style.top=(e.clientY-oy)+'px'; root.style.right='auto'; root.style.bottom='auto'; });
   document.addEventListener('mouseup', () => dragging=false);
 
-  // ── Detect meet end → final save ─────────────────────────
+  // ── Detect meet end ────────────────────────────────────────
   const LEAVE_SEL = ['[jsname="CQylAd"]','[aria-label="Leave call"]'];
   let meetStarted = false;
   const msi = setInterval(() => { if (LEAVE_SEL.some(s=>document.querySelector(s))) { meetStarted=true; clearInterval(msi); } }, 2000);
   const mei = setInterval(() => {
-    if (!location.href.includes('meet.google.com')) { clearInterval(mei); finalSave(); return; }
-    if (meetStarted && !LEAVE_SEL.some(s=>document.querySelector(s))) { clearInterval(mei); finalSave(); }
+    if (!location.href.includes('meet.google.com')) { clearInterval(mei); finalSend('url-change'); return; }
+    if (meetStarted && !LEAVE_SEL.some(s=>document.querySelector(s))) { clearInterval(mei); finalSend('leave-call'); }
   }, 3000);
-  window.addEventListener('beforeunload', finalSave);
 
-  // Init
+  // ── beforeunload: use sendBeacon for guaranteed delivery ───
+  // sendBeacon is the only reliable way to send data when the tab is closing.
+  // Regular fetch() may be aborted by the browser.
+  window.addEventListener('beforeunload', () => {
+    if (!segments.length || finalSendDone) return;
+    finalSendDone = true;
+
+    // Mark as pending-send so background can retry if beacon fails.
+    persistState('pending-send');
+
+    // Build payload and send via beacon.
+    chrome.storage.sync.get(['notionDbId', 'slackUserId'], cfg => {
+      if (!cfg.notionDbId) return;
+      const payload = {
+        meetingId:    MEETING_ID,
+        title:        meetingTitle || `Meeting ${MEETING_ID}`,
+        segments:     segments.map(s => ({ name: s.name, text: s.text, time: s.time })),
+        participants: Object.keys(speakerColors).join(', ') || '—',
+        duration:     formatDuration(startTime, Date.now()),
+        slackUserId:  cfg.slackUserId || '',
+        databaseId:   cfg.notionDbId,
+        startedAt:    new Date(startTime || Date.now()).toISOString(),
+        savedAt:      new Date().toISOString(),
+        endReason:    'tab-close'
+      };
+      try {
+        const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+        const ok = navigator.sendBeacon(N8N_WEBHOOK_URL, blob);
+        console.log('[Notetaker] sendBeacon result:', ok);
+      } catch (e) {
+        console.warn('[Notetaker] sendBeacon failed:', e.message);
+      }
+    });
+  });
+
+  // ── Init ──────────────────────────────────────────────────
   setDot('on');
   meetingTitle = getMeetingTitle();
-})();
+  tryRestore();
 
+  // On extension load, ping background to sweep pending records from other meetings too.
+  setTimeout(() => {
+    chrome.runtime.sendMessage({ type: 'RETRY_PENDING' }, () => {
+      const err = chrome.runtime.lastError;
+      if (err) console.warn('[Notetaker] retry ping failed:', err.message);
+    });
+  }, 2000);
+})();
